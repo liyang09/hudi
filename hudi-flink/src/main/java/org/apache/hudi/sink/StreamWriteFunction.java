@@ -41,21 +41,18 @@ import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
-import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.function.BiFunction;
-import java.util.stream.Collectors;
 
 /**
  * Sink function to write the data to the underneath filesystem.
@@ -63,7 +60,7 @@ import java.util.stream.Collectors;
  * <p><h2>Work Flow</h2>
  *
  * <p>The function firstly buffers the data as a batch of {@link HoodieRecord}s,
- * It flushes(write) the records batch when a batch exceeds the configured size {@link FlinkOptions#WRITE_BUCKET_SIZE}
+ * It flushes(write) the records batch when a batch exceeds the configured size {@link FlinkOptions#WRITE_BATCH_SIZE}
  * or a Flink checkpoint starts. After a batch has been written successfully,
  * the function notifies its operator coordinator {@link StreamWriteOperatorCoordinator} to mark a successful write.
  *
@@ -100,11 +97,6 @@ public class StreamWriteFunction<K, I, O>
   private static final long serialVersionUID = 1L;
 
   private static final Logger LOG = LoggerFactory.getLogger(StreamWriteFunction.class);
-
-  /**
-   * Write buffer size detector.
-   */
-  private transient BufferSizeDetector detector;
 
   /**
    * Write buffer as buckets for a checkpoint. The key is bucket ID.
@@ -231,7 +223,6 @@ public class StreamWriteFunction<K, I, O>
   // -------------------------------------------------------------------------
 
   private void initBuffer() {
-    this.detector = new BufferSizeDetector(this.config.getDouble(FlinkOptions.WRITE_BUFFER_SIZE));
     this.buckets = new LinkedHashMap<>();
   }
 
@@ -258,49 +249,18 @@ public class StreamWriteFunction<K, I, O>
   /**
    * Data bucket.
    */
-  private static class DataBucket implements Comparable<DataBucket> {
+  private static class DataBucket {
     private final List<HoodieRecord> records;
-    private final BucketSizeTracer tracer;
+    private final BufferSizeDetector detector;
 
     private DataBucket(Double batchSize) {
       this.records = new ArrayList<>();
-      this.tracer = new BucketSizeTracer(batchSize);
+      this.detector = new BufferSizeDetector(batchSize);
     }
 
     public void reset() {
       this.records.clear();
-      this.tracer.reset();
-    }
-
-    @Override
-    public int compareTo(@NotNull DataBucket other) {
-      return Double.compare(tracer.threshold, other.tracer.threshold);
-    }
-  }
-
-  /**
-   * Tool to detect if to flush out the existing bucket.
-   */
-  private static class BucketSizeTracer {
-    private final double threshold;
-
-    private long totalSize = 0L;
-
-    BucketSizeTracer(double bucketSizeMb) {
-      this.threshold = bucketSizeMb * 1024 * 1024;
-    }
-
-    /**
-     * Trace the bucket size with given record size,
-     * returns true if the bucket size exceeds specified threshold.
-     */
-    boolean trace(long recordSize) {
-      totalSize += recordSize;
-      return totalSize > this.threshold;
-    }
-
-    void reset() {
-      this.totalSize = 0L;
+      this.detector.reset();
     }
   }
 
@@ -312,13 +272,13 @@ public class StreamWriteFunction<K, I, O>
     private final Random random = new Random(47);
     private static final int DENOMINATOR = 100;
 
-    private final double threshold;
+    private final double batchSizeBytes;
 
     private long lastRecordSize = -1L;
     private long totalSize = 0L;
 
     BufferSizeDetector(double batchSizeMb) {
-      this.threshold = batchSizeMb * 1024 * 1024;
+      this.batchSizeBytes = batchSizeMb * 1024 * 1024;
     }
 
     boolean detect(Object record) {
@@ -326,7 +286,7 @@ public class StreamWriteFunction<K, I, O>
         lastRecordSize = ObjectSizeCalculator.getObjectSize(record);
       }
       totalSize += lastRecordSize;
-      return totalSize > this.threshold;
+      return totalSize > this.batchSizeBytes;
     }
 
     boolean sampling() {
@@ -337,10 +297,6 @@ public class StreamWriteFunction<K, I, O>
     void reset() {
       this.lastRecordSize = -1L;
       this.totalSize = 0L;
-    }
-
-    public void countDown(long bucketSize) {
-      this.totalSize -= bucketSize;
     }
   }
 
@@ -357,34 +313,17 @@ public class StreamWriteFunction<K, I, O>
    * Buffers the given record.
    *
    * <p>Flush the data bucket first if the bucket records size is greater than
-   * the configured value {@link FlinkOptions#WRITE_BUCKET_SIZE}.
+   * the configured value {@link FlinkOptions#WRITE_BATCH_SIZE}.
    *
    * @param value HoodieRecord
    */
   private void bufferRecord(I value) {
-    boolean flushBuffer = detector.detect(value);
-    if (flushBuffer) {
-      List<DataBucket> sortedBuckets = this.buckets.values().stream()
-          .sorted(Comparator.comparingDouble(b -> b.tracer.totalSize))
-          .collect(Collectors.toList());
-      // flush half number of buckets to avoid flushing too small buckets
-      // which cause small files.
-      int numBucketsToFlush = (sortedBuckets.size() + 1) / 2;
-      LOG.info("Flush {} data buckets because the total buffer size [{} bytes] exceeds the threshold [{} bytes]",
-          numBucketsToFlush, detector.totalSize, detector.threshold);
-      for (int i = 0; i < numBucketsToFlush; i++) {
-        DataBucket bucket = sortedBuckets.get(i);
-        flushBucket(bucket);
-        detector.countDown(bucket.tracer.totalSize);
-        bucket.reset();
-      }
-    }
     final String bucketID = getBucketID(value);
 
     DataBucket bucket = this.buckets.computeIfAbsent(bucketID,
-        k -> new DataBucket(this.config.getDouble(FlinkOptions.WRITE_BUCKET_SIZE)));
-    boolean flushBucket = bucket.tracer.trace(detector.lastRecordSize);
-    if (flushBucket) {
+        k -> new DataBucket(this.config.getDouble(FlinkOptions.WRITE_BATCH_SIZE)));
+    boolean needFlush = bucket.detector.detect(value);
+    if (needFlush) {
       flushBucket(bucket);
       bucket.reset();
     }
@@ -451,7 +390,6 @@ public class StreamWriteFunction<K, I, O>
         .build();
     this.eventGateway.sendEventToCoordinator(event);
     this.buckets.clear();
-    this.detector.reset();
     this.currentInstant = "";
   }
 }
